@@ -1,0 +1,251 @@
+# =========================================================
+# FIGURES: Lotus japonicus host response (R7A vs minSymICE)
+# R 4.0.3 compatible
+# Input: gene_count.xls (actually TSV), 8 columns of raw counts + annotations
+# Output: multiple PNG figures + key CSV tables
+# =========================================================
+
+rm(list = ls())
+setwd("/mmfs1/home/chandan.gautam/Lotus_Desq_FPKM")
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+# -------------------------
+# 1) Load counts + annotation
+# -------------------------
+counts_df <- read.delim(
+  "gene_count.xls",
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Force gene_id as character everywhere (avoids join errors)
+counts_df$gene_id <- as.character(counts_df$gene_id)
+
+# Your 8 count columns
+sample_cols <- c("R7A_5","R7A_4","R7A_3","R7A_2",
+                 "minSymICE_5","minSymICE_4","minSymICE_3","minSymICE_1")
+stopifnot(all(sample_cols %in% colnames(counts_df)))
+
+# Annotation columns to keep
+ann_cols <- c("gene_id","gene_name","gene_chr","gene_start","gene_end",
+              "gene_strand","gene_length","gene_biotype","gene_description","Family")
+stopifnot(all(ann_cols %in% colnames(counts_df)))
+
+# Build count matrix
+count_mat <- counts_df %>%
+  select(gene_id, all_of(sample_cols)) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+storage.mode(count_mat) <- "integer"
+
+# Annotation table (kept for final joins)
+ann_df <- counts_df %>%
+  select(all_of(ann_cols)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  mutate(
+    gene_start  = suppressWarnings(as.numeric(gene_start)),
+    gene_end    = suppressWarnings(as.numeric(gene_end)),
+    gene_length = suppressWarnings(as.numeric(gene_length))
+  )
+
+# -------------------------
+# 2) coldata + DESeq2
+# -------------------------
+coldata <- data.frame(
+  sample = colnames(count_mat),
+  condition = factor(c(rep("R7A", 4), rep("minSymICE", 4)),
+                     levels = c("R7A","minSymICE"))
+)
+rownames(coldata) <- coldata$sample
+
+dds <- DESeqDataSetFromMatrix(countData = count_mat, colData = coldata, design = ~ condition)
+
+# Recommended light filtering
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("condition","minSymICE","R7A"))
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  mutate(gene_id = as.character(gene_id))
+
+# Join annotation + raw counts + normalized counts in one table
+raw_counts_df <- counts_df %>%
+  select(gene_id, all_of(sample_cols)) %>%
+  mutate(gene_id = as.character(gene_id))
+
+norm_counts_df <- counts(dds, normalized = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  mutate(gene_id = as.character(gene_id))
+colnames(norm_counts_df)[-1] <- paste0(colnames(norm_counts_df)[-1], "_norm")
+
+final_tbl <- res_df %>%
+  left_join(ann_df, by = "gene_id") %>%
+  left_join(raw_counts_df, by = "gene_id") %>%
+  left_join(norm_counts_df, by = "gene_id") %>%
+  mutate(
+    padj_plot = ifelse(is.na(padj), NA, ifelse(padj == 0, 1e-300, padj)),
+    neglog10padj = -log10(padj_plot)
+  )
+
+write.csv(final_tbl, "DESeq2_FINAL_complete_results.csv", row.names = FALSE)
+
+# Create DEG table (your typical cutoff)
+DEG <- final_tbl %>% filter(!is.na(padj) & padj < 0.05 & abs(log2FoldChange) > 1)
+write.csv(DEG, "DESeq2_significant_DEGs.csv", row.names = FALSE)
+
+DEG_up   <- DEG %>% filter(log2FoldChange > 0)
+DEG_down <- DEG %>% filter(log2FoldChange < 0)
+write.csv(DEG_up,   "DESeq2_upregulated_minSymICE.csv", row.names = FALSE)
+write.csv(DEG_down, "DESeq2_downregulated_minSymICE.csv", row.names = FALSE)
+
+cat("Saved tables:\n",
+    " - DESeq2_FINAL_complete_results.csv\n",
+    " - DESeq2_significant_DEGs.csv\n",
+    " - DESeq2_upregulated_minSymICE.csv\n",
+    " - DESeq2_downregulated_minSymICE.csv\n")
+
+# =========================================================
+# FIGURE 1: PCA (QC + global separation)
+# =========================================================
+vsd <- vst(dds, blind = FALSE)
+pca <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+pct <- round(100 * attr(pca, "percentVar"))
+
+p_pca <- ggplot(pca, aes(PC1, PC2, color = condition, label = name)) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text_repel(size = 3, show.legend = FALSE) +
+  labs(
+    title = "PCA (vst): Lotus host transcriptomes",
+    subtitle = "R7A vs minSymICE (4 replicates each)",
+    x = paste0("PC1: ", pct[1], "%"),
+    y = paste0("PC2: ", pct[2], "%")
+  ) +
+  theme_classic()
+
+ggsave("FIG1_PCA_vst.png", p_pca, width = 8, height = 6, dpi = 300)
+
+# =========================================================
+# FIGURE 2: Sample correlation heatmap (base R, no pheatmap)
+# =========================================================
+mat_vsd <- assay(vsd)
+cor_mat <- cor(mat_vsd, method = "pearson")
+
+png("FIG2_SampleCorrelation_heatmap.png", width = 1800, height = 1600, res = 220)
+heatmap(cor_mat, symm = TRUE, main = "Sample correlation (vst)", margins = c(10,10))
+dev.off()
+
+# =========================================================
+# FIGURE 3: Volcano (all genes)
+# - NOTE: do NOT cut Y-axis (so dots are not truncated)
+# =========================================================
+p_volcano <- ggplot(final_tbl, aes(x = log2FoldChange, y = neglog10padj)) +
+  geom_point(alpha = 0.5, na.rm = TRUE) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(
+    title = "Volcano: minSymICE vs R7A",
+    x = "log2 Fold Change (minSymICE / R7A)",
+    y = "-log10(adjusted p-value)"
+  ) +
+  theme_classic()
+
+ggsave("FIG3_Volcano_allGenes.png", p_volcano, width = 9, height = 7, dpi = 300)
+
+# =========================================================
+# FIGURE 4: MA plot (DESeq2 standard figure)
+# =========================================================
+png("FIG4_MAplot.png", width = 1600, height = 1400, res = 220)
+plotMA(res, main = "MA plot: minSymICE vs R7A", ylim = c(-8, 8))
+dev.off()
+
+# =========================================================
+# FIGURE 5: Heatmap of TOP 50 DEGs (base R version)
+# =========================================================
+top50 <- DEG %>% arrange(padj) %>% head(50)
+
+mat_top <- counts(dds, normalized = TRUE)[top50$gene_id, , drop = FALSE]
+mat_top_log <- log2(mat_top + 1)
+
+# Row labels: prefer gene_name, fallback to gene_id
+row_labs <- top50$gene_name
+row_labs[is.na(row_labs) | row_labs == ""] <- top50$gene_id[is.na(row_labs) | row_labs == ""]
+rownames(mat_top_log) <- make.unique(row_labs)
+
+png("FIG5_Heatmap_Top50DEGs_base.png", width = 2000, height = 2200, res = 220)
+heatmap(mat_top_log, scale = "row", margins = c(10,10),
+        main = "Top 50 DEGs (padj): log2(norm+1), scaled by gene")
+dev.off()
+
+# =========================================================
+# FIGURE 6: DEG counts up vs down (simple summary panel)
+# =========================================================
+deg_counts <- data.frame(
+  Direction = c("Up in minSymICE", "Down in minSymICE"),
+  N = c(nrow(DEG_up), nrow(DEG_down))
+)
+
+p_bar <- ggplot(deg_counts, aes(x = Direction, y = N)) +
+  geom_col(alpha = 0.9) +
+  labs(title = "Differential expression summary", y = "Number of DEGs") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+ggsave("FIG6_DEG_counts_up_down.png", p_bar, width = 7, height = 5, dpi = 300)
+
+# =========================================================
+# FIGURE 7: Significant DEGs grouped by Family (counts) + save tables
+# =========================================================
+deg_family_counts <- DEG %>%
+  mutate(Family = ifelse(is.na(Family) | Family == "", "Unassigned", Family)) %>%
+  count(Family, sort = TRUE)
+
+write.csv(deg_family_counts, "DEG_byFamily_counts.csv", row.names = FALSE)
+
+# Barplot of top 25 families
+topN <- 25
+deg_family_top <- deg_family_counts %>% head(topN)
+
+p_fam <- ggplot(deg_family_top, aes(x = reorder(Family, n), y = n)) +
+  geom_col(alpha = 0.9) +
+  coord_flip() +
+  labs(
+    title = paste0("Top ", topN, " DEG Families (padj<0.05, |log2FC|>1)"),
+    x = "Family",
+    y = "Number of DEGs"
+  ) +
+  theme_classic()
+
+ggsave("FIG7_DEG_Family_top25.png", p_fam, width = 9, height = 7, dpi = 300)
+
+# "Keep ALL details like original DEG table" but grouped by Family:
+# We keep the same columns; just sort by Family then padj.
+DEG_grouped_full <- DEG %>%
+  mutate(Family = ifelse(is.na(Family) | Family == "", "Unassigned", Family)) %>%
+  arrange(Family, padj, desc(abs(log2FoldChange)))
+
+write.csv(DEG_grouped_full, "DESeq2_significant_DEGs_groupedByFamily_FULL.csv", row.names = FALSE)
+
+cat("Saved figures:\n",
+    " - FIG1_PCA_vst.png\n",
+    " - FIG2_SampleCorrelation_heatmap.png\n",
+    " - FIG3_Volcano_allGenes.png\n",
+    " - FIG4_MAplot.png\n",
+    " - FIG5_Heatmap_Top50DEGs_base.png\n",
+    " - FIG6_DEG_counts_up_down.png\n",
+    " - FIG7_DEG_Family_top25.png\n\n",
+    "Saved family tables:\n",
+    " - DEG_byFamily_counts.csv\n",
+    " - DESeq2_significant_DEGs_groupedByFamily_FULL.csv\n"
+)
