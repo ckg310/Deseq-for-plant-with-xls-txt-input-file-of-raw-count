@@ -1,0 +1,61 @@
+rm(list=ls())
+setwd("/mmfs1/home/chandan.gautam/Lotus_Desq_FPKM")
+
+# 1) Load full DESeq2 results (has log2FoldChange etc.)
+allres <- read.csv("DESeq2_FINAL_complete_results.csv",
+                   stringsAsFactors = FALSE, check.names = FALSE)
+allres$gene_id <- as.character(allres$gene_id)
+
+# 2) Build your KEGG nitrogen gene ↔ KO/EC mapping table
+kegg_map <- data.frame(
+  gene_id = c(
+    "130709455","130709883","130711053","130711109","130711889","130711901",
+    "130719130","130720621","130720713","130721115","130722232","130722265",
+    "130724651","130726158","130729566","130729875","130730088","130731624",
+    "130731813","130732586","130734287","130738745","130739221","130739337",
+    "130740009","130741011","130742482","130742999","130746600","130747246",
+    "130747247"
+  ),
+  KO = c(
+    "K00262","K01455","K00366","K02575","K00261","K01455",
+    "K01674","K01674","K01674","K01674","K01915","K01915",
+    "K01673","K01725","K02575","K00261","K00284","K01915",
+    "K01673","K01674","K10534","K01915","K01673","K01673",
+    "K01673","K00261","K01674","K01674","K00262","K02575",
+    "K02575"
+  ),
+  EC = c(
+    "1.4.1.4","3.5.1.49","1.7.7.1", NA, "1.4.1.3","3.5.1.49",
+    "4.2.1.1","4.2.1.1","4.2.1.1","4.2.1.1","6.3.1.2","6.3.1.2",
+    "4.2.1.1","4.2.1.104", NA, "1.4.1.3","1.4.7.1","6.3.1.2",
+    "4.2.1.1","4.2.1.1","1.7.1.1/1.7.1.2/1.7.1.3","6.3.1.2",
+    "4.2.1.1","4.2.1.1","4.2.1.1","1.4.1.3","4.2.1.1","4.2.1.1",
+    "1.4.1.4", NA, NA
+  ),
+  stringsAsFactors = FALSE
+)
+
+# 3) Extract nitrogen genes from your full DESeq2 results (even if not significant)
+nitro <- allres[allres$gene_id %in% kegg_map$gene_id, , drop = FALSE]
+
+# 4) Add direction based on log2FoldChange (minSymICE / R7A)
+nitro$Direction_minSymICE <- ifelse(
+  is.na(nitro$log2FoldChange), "NA",
+  ifelse(nitro$log2FoldChange > 0, "Up in minSymICE",
+         ifelse(nitro$log2FoldChange < 0, "Down in minSymICE", "No change"))
+)
+
+# Optional: significance flag
+nitro$Significant_padj0.05 <- ifelse(!is.na(nitro$padj) & nitro$padj < 0.05, "Yes", "No")
+
+# 5) Merge KO/EC into the table
+nitro2 <- merge(kegg_map, nitro, by = "gene_id", all.x = TRUE)
+
+# 6) Sort by strongest changes first
+nitro2 <- nitro2[order(-abs(nitro2$log2FoldChange), nitro2$padj), ]
+
+# 7) Save final
+write.csv(nitro2, "ALL_NitrogenMetabolism_genes_with_KO_EC_andDirection.csv", row.names = FALSE)
+
+cat("Saved: ALL_NitrogenMetabolism_genes_with_KO_EC_andDirection.csv\n")
+cat("Rows:", nrow(nitro2), "\n")
